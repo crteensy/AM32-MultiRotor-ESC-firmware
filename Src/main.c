@@ -1,5 +1,8 @@
 /* AM32- multi-purpose brushless controller firmware for the stm32f051 */
 
+//===========================================================================
+//=============================== Changelog =================================
+//===========================================================================
 /*
  * 1.54 Changelog;
  * --Added firmware name to targets and firmware version to main
@@ -64,7 +67,7 @@
  *-- increase max change a low rpm x10
  *-- set low limit of throttle ramp to a lower point and increase upper range
  *-- change desync event from full restart to just lower throttle.
- 
+
  *1.64
  * --added startup check for continuous high signal, reboot to enter bootloader.
  *-- added brake on stop from eeprom
@@ -85,13 +88,96 @@
  *-- added settings to EEPROM version 1
  *-- add gimbal control option.
  *--
+ *1.66
+ *-- move idwg init to after input tune
+ *-- remove reset after save command -- dshot
+ *-- added wraith32 target
+ *-- added average pulse check for signal detection
  *--
- */
+ *1.67
+ *-- Rework file structure for multiple MCU support
+ *-- Add g071 mcu
+ *--
+ *1.68
+ *--increased allowed average pulse length to avoid double startup
+ *1.69
+ *--removed line re-enabling comparator after disabling.
+ *1.70 fix dshot for Kiss FC
+ *1.71 fix dshot for Ardupilot / Px4 FC
+ *1.72 Fix telemetry output and add 1 second arming.
+ *1.73 Fix false arming if no signal. Remove low rpm throttle protection below 300kv
+ *1.74 Add Sine Mode range and drake brake strength adjustment
+ *1.75 Disable brake on stop for PWM_ENABLE_BRIDGE 
+	   Removed automatic brake on stop on neutral for RC car proportional brake.
+	   Adjust sine speed and stall protection speed to more closely match
+	   makefile fixes from Cruwaller 
+	   Removed gd32 build, until firmware is functional
+ *1.76 Adjust g071 PWM frequency, and startup power to be same frequency as f051. 
+       Reduce number of polling back emf checks for g071
+ *1.77 increase PWM frequency range to 8-48khz
+ *1.78 Fix bluejay tunes frequency and speed. 
+	   Fix g071 Dead time 	
+	   Increment eeprom version
+ *1.79 Add stick throttle calibration routine  
+	   Add variable for telemetry interval
+ *1.80 -Enable Comparator blanking for g071 on timer 1 channel 4
+	   -add hardware group F for Iflight Blitz
+	   -adjust parameters for pwm frequency
+	   -add sine mode power variable and eeprom setting
+	   -fix telemetry rpm during sine mode
+	   -fix sounds for extended pwm range
+	   -Add adjustable braking strength when driving
+ *1.81 -Add current limiting PID loop
+ 	   -fix current sense scale
+ 	   -Increase brake power on maximum reverse ( car mode only)
+	   -Add HK and Blpwr targets
+	   -Change low kv motor throttle limit
+	   -add reverse speed threshold changeover based on motor kv
+	   -doubled filter length for motors under 900kv
+*1.82  -Add speed control pid loop.
+*1.83  -Add stall protection pid loop.
+  	   -Improve sine mode transition.
+  	   -decrease speed step re-entering sine mode
+  	   -added fixed duty cycle and speed mode build option
+  	   -added rpm_controlled by input signal ( to be added to config tool )
+*1.84  -Change PID value to int for faster calculations
+	   -Enable two channel brushed motor control for dual motors
+	   -Add current limit max duty cycle
+*1.85  -fix current limit not allowing full rpm on g071 or low pwm frequency
+		-remove unused brake on stop conditional 
+*1.86  - create do-once in sine mode instead of setting pwm mode each time.
+*1.87  - fix fixed mode max rpm limits
+*1.88  - Fix stutter on sine mode re-entry due to position reset
+*1.89  - Fix drive by rpm mode scaling.
+ 	   - Fix dshot px4 timings
+*1.90  - Disable comp interrupts for brushed mode
+	   - Re-enter polling mode after prop strike or desync
+	   - add G071 "N" variant
+	   - add preliminary Extended Dshot
+*1.91  - Reset average interval time on desync only after 100 zero crosses 
+*1.92  - Move g071 comparator blanking to TIM1 OC5
+ 	   - Increase ADC read frequency and current sense filtering 
+	   - Add addressable LED strip for G071 targets
+*1.93  - Optimization for build process
+       - Add firmware file name to each target hex file
+       -fix extended telemetry not activating dshot600
+       -fix low voltage cuttoff timeout
+*1.94  - Add selectable input types
+*1.95  - reduce timeout to 0.5 seconds when armed
+*1.96  - Improved erpm accuracy dshot and serial telemetry, thanks Dj-Uran
+	     - Fix PID loop integral.	
+		 - add overcurrent low voltage cuttoff to brushed mode.
+*1.97    - enable input pullup 
+*1.98    - Dshot erpm rounding compensation.
+*1.99    - Add max duty cycle change to individual targets ( will later become an settings option)
+		 - Fix dshot telemetry delay f4 and e230 mcu
+
+*/
 
 #include <stdint.h>
 #include "main.h"
-
 #include "targets.h"
+#include "signal.h"
 #include "dshot.h"
 #include "phaseouts.h"
 #include "eeprom.h"
@@ -102,9 +188,113 @@
 #include "comparator.h"
 #include "functions.h"
 #include "peripherals.h"
+#include "common.h"
 
-#define VERSION_MAJOR 1
-#define VERSION_MINOR 65
+#ifdef USE_LED_STRIP
+#include "WS2812.h"
+#endif
+
+#ifdef USE_CRSF_INPUT
+#include "crsf.h"
+
+#endif
+
+#define VERSION_MAJOR 2
+#define VERSION_MINOR 00
+
+//firmware build options !! fixed speed and duty cycle modes are not to be used with sinusoidal startup !!
+
+//#define FIXED_DUTY_MODE  // bypasses signal input and arming, uses a set duty cycle. For pumps, slot cars etc
+//#define FIXED_DUTY_MODE_POWER 100     // 0-100 percent not used in fixed speed mode
+
+//#define FIXED_SPEED_MODE  // bypasses input signal and runs at a fixed rpm using the speed control loop PID
+//#define FIXED_SPEED_MODE_RPM  1000  // intended final rpm , ensure pole pair numbers are entered correctly in config tool.
+
+//#define BRUSHED_MODE         // overrides all brushless config settings, enables two channels for brushed control
+//#define GIMBAL_MODE     // also sinusoidal_startup needs to be on, maps input to sinusoidal angle.
+
+//===========================================================================
+//=============================  Defaults =============================
+//===========================================================================
+
+uint8_t drive_by_rpm = 0;
+uint32_t MAXIMUM_RPM_SPEED_CONTROL = 5000;
+uint32_t MINIMUM_RPM_SPEED_CONTROL = 500;
+
+ //assign speed control PID values values are x10000
+ fastPID speedPid = {      //commutation speed loop time
+ 		.Kp = 10,
+ 		.Ki = 0,
+ 		.Kd = 100,
+ 		.integral_limit = 10000,
+ 		.output_limit = 50000
+ };
+
+ fastPID currentPid = {   // 1khz loop time
+ 		.Kp = 800,
+ 		.Ki = 0,
+ 		.Kd = 1000,
+ 		.integral_limit = 20000,
+ 		.output_limit = 100000
+ };
+
+ fastPID stallPid = {          //1khz loop time
+ 		.Kp = 2,
+ 		.Ki = 0,
+ 		.Kd = 50,
+ 		.integral_limit = 10000,
+ 		.output_limit = 50000
+ };
+
+ enum inputType{
+	 AUTO_IN,
+	 DSHOT_IN,
+	 SERVO_IN,
+	 SERIAL_IN,
+	 EDTARM,
+ };
+
+uint16_t target_e_com_time_high;
+uint16_t target_e_com_time_low;
+
+
+uint8_t crsf_input_channel = 1;
+char eeprom_layout_version = 2;
+char dir_reversed = 0;
+char comp_pwm = 1;
+char VARIABLE_PWM = 1;
+char bi_direction = 0;
+char stuck_rotor_protection = 1;	// Turn off for Crawlers
+char brake_on_stop = 0;
+char stall_protection = 0;
+char use_sin_start = 0;
+char TLM_ON_INTERVAL = 0;
+uint8_t telemetry_interval_ms = 30;
+uint8_t TEMPERATURE_LIMIT = 255;  // degrees 255 to disable
+char advance_level = 2;			// 7.5 degree increments 0 , 7.5, 15, 22.5)
+uint16_t motor_kv = 2000;
+char motor_poles = 14;
+uint16_t CURRENT_LIMIT = 202;
+uint8_t sine_mode_power = 5;
+char drag_brake_strength = 10;		// Drag Brake Power when brake on stop is enabled
+uint8_t driving_brake_strength = 10;
+uint8_t dead_time_override = DEAD_TIME;
+char sine_mode_changeover_thottle_level = 5;	// Sine Startup Range
+uint16_t stall_protect_target_interval = TARGET_STALL_PROTECTION_INTERVAL;
+char USE_HALL_SENSOR = 0;
+uint16_t enter_sine_angle = 180;
+char do_once_sinemode= 0;
+//============================= Servo Settings ==============================
+uint16_t servo_low_threshold = 1100;	// anything below this point considered 0
+uint16_t servo_high_threshold = 1900;	// anything above this point considered 2000 (max)
+uint16_t servo_neutral = 1500;
+uint8_t servo_dead_band = 100;
+
+//========================= Battery Cuttoff Settings ========================
+char LOW_VOLTAGE_CUTOFF = 0;		// Turn Low Voltage CUTOFF on or off
+uint16_t low_cell_volt_cutoff = 330;	// 3.3volts per cell
+
+//=========================== END EEPROM Defaults ===========================
 
 typedef struct __attribute__((packed)) {
   uint8_t version_major;
@@ -118,68 +308,59 @@ firmware_info_s __attribute__ ((section(".firmware_info"))) firmware_info = {
   device_name: FIRMWARE_NAME
 };
 
-char BRUSHED_MODE = 0;         // overrides everything else
-char RC_CAR_REVERSE = 0;         // have to set bidirectional, comp_pwm off and stall protection off, no sinusoidal startup
-char GIMBAL_MODE = 0;     // also sinusoidal_startup needs to be on.
+const char filename[30] __attribute__((section(".file_name"))) = FILE_NAME;
 
+uint8_t EEPROM_VERSION;
+//move these to targets folder or peripherals for each mcu
+char RC_CAR_REVERSE = 0;   // have to set bidirectional, comp_pwm off and stall protection off, no sinusoidal startup
+uint16_t ADC_CCR = 30;
 uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 
+uint16_t target_e_com_time = 0;
+int16_t Speed_pid_output;
+char use_speed_control_loop = 0;
+float input_override = 0;
+int16_t	use_current_limit_adjust = 2000;
+char use_current_limit = 0;
+float stall_protection_adjust = 0;
 
-#define APPLICATION_ADDRESS 0x08001000
-#define EEPROM_START_ADD  (uint32_t)0x08007C00
+uint32_t MCU_Id = 0;
+uint32_t REV_Id = 0;
 
+uint16_t armed_timeout_count;
+uint16_t reverse_speed_threshold = 1500;
 uint8_t desync_happened = 0;
 char maximum_throttle_change_ramp = 1;
-
-char crawler_mode = 0;
+  
+char crawler_mode = 0;  // no longer used //
 uint16_t velocity_count = 0;
-uint16_t velocity_count_threshold = 50;
+uint16_t velocity_count_threshold = 75;
 
-uint16_t servo_low_threshold = 1100; // anything below this point considered 0
-uint16_t servo_high_threshold = 1900;  // anything above this point considered 2000 (max)
-uint16_t servo_neutral = 1500;
-uint8_t servo_dead_band = 100;
-
-char brake_on_stop = 0;
-char dir_reversed = 0;
-char bi_direction = 0;
-char use_sin_start = 0;
 char low_rpm_throttle_limit = 1;
 
 uint16_t low_voltage_count = 0;
+uint16_t telem_ms_count;
 
-char THIRTY_TWO_MS_TLM = 0;
-uint16_t thirty_two_ms_count;
-char LOW_VOLTAGE_CUTOFF = 0;
-char VOLTAGE_DIVIDER = 11;     // 100k upper and 10k lower resistor in divider
-
+char VOLTAGE_DIVIDER = TARGET_VOLTAGE_DIVIDER;     // 100k upper and 10k lower resistor in divider
 uint16_t battery_voltage;  // scale in volts * 10.  1260 is a battery voltage of 12.60
-uint16_t low_cell_volt_cutoff = 330; // 3.3volts per cell
 char cell_count = 0;
-
 char brushed_direction_set = 0;
 
+uint16_t tenkhzcounter = 0;
+float consumed_current = 0;
+int32_t smoothed_raw_current = 0;
+int16_t actual_current = 0;
 
-uint16_t smoothed_raw_current = 0;
-uint8_t actual_current = 0;
-
-uint16_t motor_kv = 2000;
-char motor_poles = 14;
-char VARIABLE_PWM = 1;
 char lowkv = 0;
-char comp_pwm = 1;
-int min_startup_duty = 120;
-int sin_mode_min_s_d = 120;
+
+uint16_t min_startup_duty = 120;
+uint16_t sin_mode_min_s_d = 120;
 char bemf_timeout = 10;
-char advance_level = 2;                // 7.5 degree increments 0 , 7.5, 15, 22.5)
-char stuck_rotor_protection = 1;
-char startup_boost = 35;
-char stall_protection = 0;
+
+char startup_boost = 50;
 char reversing_dead_band = 1;
 
-uint16_t oneKhz_timer = 0;
-int checkcount = 0;
 uint16_t low_pin_count = 0;
 
 uint8_t max_duty_cycle_change = 2;
@@ -193,17 +374,19 @@ typedef enum
   GPIO_PIN_SET
 }GPIO_PinState;
 
+uint16_t startup_max_duty_cycle = 300 + DEAD_TIME;
 uint16_t minimum_duty_cycle = DEAD_TIME;
+uint16_t stall_protect_minimum_duty = DEAD_TIME;
 char desync_check = 0;
 char low_kv_filter_level = 20;
 
-
-uint16_t TIMER1_MAX_ARR = 1999;
-int duty_cycle_maximum = 1999;
-int low_rpm_level  = 20;        // thousand erpm
-int high_rpm_level = 70;      //
-int throttle_max_at_low_rpm  = 400;
-int throttle_max_at_high_rpm = 1999;
+uint16_t tim1_arr = TIM1_AUTORELOAD;         // current auto reset value
+uint16_t TIMER1_MAX_ARR = TIM1_AUTORELOAD;      // maximum auto reset register value
+uint16_t duty_cycle_maximum = TIM1_AUTORELOAD;     //restricted by temperature or low rpm throttle protect
+uint16_t low_rpm_level  = 20;        // thousand erpm used to set range for throttle resrictions
+uint16_t high_rpm_level = 70;      //
+uint16_t throttle_max_at_low_rpm  = 400;
+uint16_t throttle_max_at_high_rpm = TIM1_AUTORELOAD;
 
 uint16_t commutation_intervals[6] = {0};
 uint32_t average_interval = 0;
@@ -212,69 +395,48 @@ int e_com_time;
 
 uint16_t ADC_smoothed_input = 0;
 uint8_t degrees_celsius;
+uint16_t converted_degrees;
+uint8_t temperature_offset;
 uint16_t ADC_raw_temp;
 uint16_t ADC_raw_volts;
 uint16_t ADC_raw_current;
 uint16_t ADC_raw_input;
-int adc_counter = 0;
+uint8_t adc_counter = 0;
 char send_telemetry = 0;
 char telemetry_done = 0;
 char prop_brake_active = 0;
 
-uint8_t eepromBuffer[48] ={0};
-uint32_t gcr[30] =  {0,0,0,0,0,0,0,0,0,0,0,64,0,0,0,0,64,0,0,0,0,64,0,0,0,64,64,0,64,0};
-uint8_t gcr_size;
-uint16_t process_time = 0;
+uint8_t eepromBuffer[176] ={0};
 
 char dshot_telemetry = 0;
-char output = 0;
-int dshot_frametime = 0;
 
-uint16_t phase_a_interval = 0;
-uint16_t phase_b_interval = 0;
-uint16_t phase_c_interval = 0;
-uint32_t current_EXTI_LINE;
-
-int dshot_goodcounts = 0;
-int dshot_badcounts = 0;
 uint8_t last_dshot_command = 0;
 char old_routine = 0;
-int adjusted_input;
+uint16_t adjusted_input = 0;
 
 #define TEMP30_CAL_VALUE            ((uint16_t*)((uint32_t)0x1FFFF7B8))
 #define TEMP110_CAL_VALUE           ((uint16_t*)((uint32_t)0x1FFFF7C2))
 
-int temp110cal;
-int temp30cal;
-int smoothedinput = 0;
-int voltageraw;
-
-const int numReadings = 30;     // the readings from the analog input
-int readIndex = 0;              // the index of the current reading
+uint16_t smoothedinput = 0;
+const uint8_t numReadings = 30;     // the readings from the analog input
+uint8_t readIndex = 0;              // the index of the current reading
 int total = 0;
-int readings[30];
-int tempraw = 0;
-int temp_degrees = 0;
+uint16_t readings[30];
 
-int bemf_timout_happened = 0;
-int timeout_count = 0;
-int bemf_timeout_threshold = 10;
-
-int changeover_step = 5;
-int filter_level = 5;
-int running = 0;
-int advance = 0;
-int advancedivisor = 6;
-int START_ARR=800;
+uint8_t bemf_timeout_happened = 0;
+uint8_t changeover_step = 5;
+uint8_t filter_level = 5;
+uint8_t running = 0;
+uint16_t advance = 0;
+uint8_t advancedivisor = 6;
 char rising = 1;
-int count = 0;
+
 
 ////Space Vector PWM ////////////////
 //const int pwmSin[] ={128, 132, 136, 140, 143, 147, 151, 155, 159, 162, 166, 170, 174, 178, 181, 185, 189, 192, 196, 200, 203, 207, 211, 214, 218, 221, 225, 228, 232, 235, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 248, 249, 250, 250, 251, 252, 252, 253, 253, 253, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 254, 253, 253, 253, 252, 252, 251, 250, 250, 249, 248, 248, 247, 246, 245, 244, 243, 242, 241, 240, 239, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 248, 249, 250, 250, 251, 252, 252, 253, 253, 253, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 254, 253, 253, 253, 252, 252, 251, 250, 250, 249, 248, 248, 247, 246, 245, 244, 243, 242, 241, 240, 239, 238, 235, 232, 228, 225, 221, 218, 214, 211, 207, 203, 200, 196, 192, 189, 185, 181, 178, 174, 170, 166, 162, 159, 155, 151, 147, 143, 140, 136, 132, 128, 124, 120, 116, 113, 109, 105, 101, 97, 94, 90, 86, 82, 78, 75, 71, 67, 64, 60, 56, 53, 49, 45, 42, 38, 35, 31, 28, 24, 21, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 8, 7, 6, 6, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 8, 7, 6, 6, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 24, 28, 31, 35, 38, 42, 45, 49, 53, 56, 60, 64, 67, 71, 75, 78, 82, 86, 90, 94, 97, 101, 105, 109, 113, 116, 120, 124};
 
-
 ////Sine Wave PWM ///////////////////
-const int pwmSin[] = {180,183,186,189,193,196,199,202,
+int16_t pwmSin[] = {180,183,186,189,193,196,199,202,
 		205,208,211,214,217,220,224,227,
 		230,233,236,239,242,245,247,250,
 		253,256,259,262,265,267,270,273,
@@ -321,57 +483,50 @@ const int pwmSin[] = {180,183,186,189,193,196,199,202,
 		155,158,161,164,167,171,174,177};
 
 
-int sin_divider = 2;
-int phase_A_position;
-int phase_B_position;
-int phase_C_position;
-int step_delay  = 100;
+//int sin_divider = 2;
+int16_t phase_A_position;
+int16_t phase_B_position;
+int16_t phase_C_position;
+uint16_t step_delay  = 100;
 char stepper_sine = 0;
-int forward = 1;
-int gate_drive_offset = 60;
+char forward = 1;
+uint16_t gate_drive_offset = DEAD_TIME;
 
-int stuckcounter = 0;
-int k_erpm;
+uint8_t stuckcounter = 0;
+uint16_t k_erpm;
+uint16_t e_rpm;      // electrical revolution /100 so,  123 is 12300 erpm
 
 uint16_t adjusted_duty_cycle;
-uint16_t tim1_arr = 1999;
-int bad_count = 0;
-int dshotcommand;
-int armed_count_threshold = 1000;
+
+uint8_t bad_count = 0;
+uint8_t bad_count_threshold = CPU_FREQUENCY_MHZ / 24 ;
+uint8_t dshotcommand;
+uint16_t armed_count_threshold = 1000;
 
 char armed = 0;
-int zero_input_count = 0;
+uint16_t zero_input_count = 0;
 
-int input = 0;
-int newinput =0;
+uint16_t input = 0;
+uint16_t newinput =0;
 char inputSet = 0;
 char dshot = 0;
-char proshot = 0;
-char multishot = 0;
-char oneshot42 = 0;
-char oneshot125 = 0;
 char servoPwm = 0;
-int zero_crosses;
+uint32_t zero_crosses;
 
-int zcfound = 0;
+uint8_t zcfound = 0;
 
-int bemfcounter;
-int min_bemf_counts_up = 7;
-int min_bemf_counts_down = 7;
-int adc_timer = 600;
-int lastzctime;
+uint8_t bemfcounter;
+uint8_t min_bemf_counts_up = TARGET_MIN_BEMF_COUNTS;
+uint8_t min_bemf_counts_down = TARGET_MIN_BEMF_COUNTS;
+
+uint16_t lastzctime;
 uint16_t thiszctime;
-int phase = 1;
-int duty_cycle = 0;
+
+uint16_t duty_cycle = 0;
 char step = 1;
 uint16_t commutation_interval = 12500;
-int pwm = 1;
-int floating =2;
-int lowside = 3;
-int sensorless = 1;
-uint32_t waitTime = 0;
-int signaltimeout = 0;
-
+uint16_t waitTime = 0;
+uint16_t signaltimeout = 0;
 uint8_t ubAnalogWatchdogStatus = RESET;
 
 
@@ -385,7 +540,7 @@ for(int i = 0 ; i < 1000; i ++){
 	 }
      delayMicros(10);
 }
-LL_GPIO_SetPinPull(INPUT_PIN_PORT, INPUT_PIN, LL_GPIO_PULL_NO);
+LL_GPIO_SetPinPull(INPUT_PIN_PORT, INPUT_PIN, LL_GPIO_PULL_UP);
 	 if(low_pin_count > 5){
 		 return;      // its either a signal or a disconnected pin
 	 }else{
@@ -394,8 +549,37 @@ LL_GPIO_SetPinPull(INPUT_PIN_PORT, INPUT_PIN, LL_GPIO_PULL_NO);
 	 }
 }
 
+
+
+float doPidCalculations(struct fastPID *pidnow, int actual, int target){
+
+	pidnow->error = actual - target;
+	pidnow->integral = pidnow->integral + pidnow->error*pidnow->Ki;
+	if(pidnow->integral > pidnow->integral_limit){
+		pidnow->integral = pidnow->integral_limit;
+	}
+	if(pidnow->integral < -pidnow->integral_limit){
+		pidnow->integral = -pidnow->integral_limit;
+	}
+
+	pidnow->derivative = pidnow->Kd * (pidnow->error - pidnow->last_error);
+	pidnow->last_error = pidnow->error;
+
+	pidnow->pid_output = pidnow->error*pidnow->Kp + pidnow->integral + pidnow->derivative;
+
+
+	if (pidnow->pid_output>pidnow->output_limit){
+		pidnow->pid_output = pidnow->output_limit;
+	}if(pidnow->pid_output <-pidnow->output_limit){
+		pidnow->pid_output = -pidnow->output_limit;
+	}
+	return pidnow->pid_output;
+
+}
+
+
 void loadEEpromSettings(){
-	   read_flash_bin( eepromBuffer , 0x08007c00 , 48);
+	   read_flash_bin( eepromBuffer , EEPROM_START_ADD , 176);
 
 	   if(eepromBuffer[17] == 0x01){
 	 	  dir_reversed =  1;
@@ -409,7 +593,7 @@ void loadEEpromSettings(){
 	   }
 	   if(eepromBuffer[19] == 0x01){
 	 	  use_sin_start = 1;
-	 	 min_startup_duty = sin_mode_min_s_d;
+	 //	 min_startup_duty = sin_mode_min_s_d;
 	   }
 	   if(eepromBuffer[20] == 0x01){
 	  	  comp_pwm = 1;
@@ -432,25 +616,34 @@ void loadEEpromSettings(){
 	    	advance_level = 2;  // * 7.5 increments
 	    }
 
-	   if(eepromBuffer[24] < 49 && eepromBuffer[24] > 23){
-		   TIMER1_MAX_ARR = map (eepromBuffer[24], 24, 48, 1999 ,999);
+	   if(eepromBuffer[24] < 49 && eepromBuffer[24] > 7){
+		   if(eepromBuffer[24] < 49 && eepromBuffer[24] > 23){
+			   TIMER1_MAX_ARR = map (eepromBuffer[24], 24, 48, TIM1_AUTORELOAD,TIM1_AUTORELOAD/2);
+		   }
+		   if(eepromBuffer[24] < 24 && eepromBuffer[24] > 11){
+			   TIMER1_MAX_ARR = map (eepromBuffer[24], 12, 24, TIM1_AUTORELOAD *2 ,TIM1_AUTORELOAD);
+		   }
+		   if(eepromBuffer[24] < 12 && eepromBuffer[24] > 7){
+			   TIMER1_MAX_ARR = map (eepromBuffer[24], 7, 16, TIM1_AUTORELOAD *3 ,TIM1_AUTORELOAD/2*3);
+		   }
 		   TIM1->ARR = TIMER1_MAX_ARR;
+		   throttle_max_at_high_rpm = TIMER1_MAX_ARR;
+		   duty_cycle_maximum = TIMER1_MAX_ARR;
 	    }else{
-	    	tim1_arr = 1999;
+	    	tim1_arr = TIM1_AUTORELOAD;
 	    	TIM1->ARR = tim1_arr;
 	    }
 
 	   if(eepromBuffer[25] < 151 && eepromBuffer[25] > 49){
-		   min_startup_duty = eepromBuffer[25]/ 2 + 10 + startup_boost;
-		   minimum_duty_cycle = eepromBuffer[25]/ 2 + DEAD_TIME/3;
+	   min_startup_duty = (eepromBuffer[25] + DEAD_TIME) * TIMER1_MAX_ARR / 2000;
+	   minimum_duty_cycle = (eepromBuffer[25]/ 2 + DEAD_TIME/3) * TIMER1_MAX_ARR / 2000 ;
+	   stall_protect_minimum_duty = minimum_duty_cycle+10;
 	    }else{
 	    	min_startup_duty = 150;
 	    	minimum_duty_cycle = (min_startup_duty / 2) + 10;
 	    }
-
-       motor_kv = (eepromBuffer[26] * 40) + 20;
-       motor_poles = eepromBuffer[27];
-       
+      motor_kv = (eepromBuffer[26] * 40) + 20;
+      motor_poles = eepromBuffer[27];
 	   if(eepromBuffer[28] == 0x01){
 		   brake_on_stop = 1;
 	    }else{
@@ -461,7 +654,7 @@ void loadEEpromSettings(){
 	    }else{
 	    	stall_protection = 0;
 	    }
-	   
+	   setVolume(5);
 	   if(eepromBuffer[1] > 0){             // these commands weren't introduced until eeprom version 1.
 
 		   if(eepromBuffer[30] > 11){
@@ -470,9 +663,9 @@ void loadEEpromSettings(){
 			   setVolume(eepromBuffer[30]);
 		   }
 		   if(eepromBuffer[31] == 0x01){
-			   THIRTY_TWO_MS_TLM = 1;
+			   TLM_ON_INTERVAL = 1;
 		   }else{
-			   THIRTY_TWO_MS_TLM = 0;
+			   TLM_ON_INTERVAL = 0;
 		   }
 		   servo_low_threshold = (eepromBuffer[32]*2) + 750; // anything below this point considered 0
 		   servo_high_threshold = (eepromBuffer[33]*2) + 1750;;  // anything above this point considered 2000 (max)
@@ -491,11 +684,87 @@ void loadEEpromSettings(){
 		   }else{
 			   RC_CAR_REVERSE = 0;
 		   }
+		   if(eepromBuffer[39] == 0x01){
+#ifdef HAS_HALL_SENSORS
+			   USE_HALL_SENSOR = 1;
+#else
+			   USE_HALL_SENSOR = 0;
+#endif
+		   }else{
+			   USE_HALL_SENSOR = 0;
+		   }
+	   if(eepromBuffer[40] > 4 && eepromBuffer[40] < 26){            // sine mode changeover 5-25 percent throttle
+       sine_mode_changeover_thottle_level = eepromBuffer[40];
+	   }
+	   if(eepromBuffer[41] > 0 && eepromBuffer[41] < 11){        // drag brake 1-10
+       drag_brake_strength = eepromBuffer[41];
+	   }
+	   
+	   if(eepromBuffer[42] > 0 && eepromBuffer[42] < 10){        // motor brake 1-9
+       driving_brake_strength = eepromBuffer[42];
+	   dead_time_override = DEAD_TIME + (150 - (driving_brake_strength * 10));
+	   if(dead_time_override > 200){
+	   dead_time_override = 200;
+	   }
+	   min_startup_duty = eepromBuffer[25] + dead_time_override;
+	   minimum_duty_cycle = eepromBuffer[25]/2 + dead_time_override;
+	   throttle_max_at_low_rpm  = throttle_max_at_low_rpm + dead_time_override;
+	   startup_max_duty_cycle = startup_max_duty_cycle  + dead_time_override;
+	   TIM1->BDTR |= dead_time_override;
+	   }
+	   
+	   if(eepromBuffer[43] >= 70 && eepromBuffer[43] <= 140){ 
+	   TEMPERATURE_LIMIT = eepromBuffer[43];
+	   
+	   }
+	   
+	   if(eepromBuffer[44] > 0 && eepromBuffer[44] < 100){
+	   CURRENT_LIMIT = eepromBuffer[44] * 2;
+	   use_current_limit = 1;
+	   
+	   }
+	   if(eepromBuffer[45] > 0 && eepromBuffer[45] < 11){ 
+	   sine_mode_power = eepromBuffer[45];
 	   }
 
-	   low_rpm_level  = motor_kv / 200 / (16 / motor_poles);
-	   high_rpm_level = (40 + (motor_kv / 100)) / (16/motor_poles);
-	   
+
+	   if(eepromBuffer[46] >= 0 && eepromBuffer[46] < 10){
+		   switch (eepromBuffer[46]){
+		   case AUTO_IN:
+			   dshot= 0;
+			   servoPwm = 0;
+			   EDT_ARMED = 1;
+			   break;
+		   case DSHOT_IN:
+			   dshot = 1;
+			   EDT_ARMED = 1;
+			   break;
+		   case SERVO_IN:
+			   servoPwm = 1;
+			   break;
+		   case SERIAL_IN:
+			   break;
+		   case EDTARM:
+			   EDT_ARM_ENABLE = 1;
+			   EDT_ARMED = 0;
+			   dshot = 1;
+			   break;
+		   };
+	   }else{
+		   dshot = 0;
+		   servoPwm = 0;
+		   EDT_ARMED = 1;
+	   }
+
+
+       if(motor_kv < 300){
+		   low_rpm_throttle_limit = 0;
+	   }
+	   low_rpm_level  = motor_kv / 100 / (32 / motor_poles);
+	   high_rpm_level = motor_kv / 17 / (32/motor_poles);
+	   }
+//	   reverse_speed_threshold =  map(motor_kv, 300, 3000, 2500 , 1250);
+	   reverse_speed_threshold = 200;
 	if(!comp_pwm){
 		bi_direction = 0;
 	}
@@ -504,9 +773,9 @@ void loadEEpromSettings(){
 
 }
 
-void saveEEpromSettings(){
+void saveEEpromSettings(){    
 
-
+   eepromBuffer[1] = eeprom_layout_version;
    if(dir_reversed == 1){
 	   eepromBuffer[17] = 0x01;
    }else{
@@ -538,43 +807,10 @@ void saveEEpromSettings(){
       }else{
     	  eepromBuffer[22] = 0x00;
       }
-
-
    eepromBuffer[23] = advance_level;
-
-   save_flash_nolib(eepromBuffer, 48, EEPROM_START_ADD);
+   save_flash_nolib(eepromBuffer, 176, EEPROM_START_ADD);
 }
 
-
-void initAfterJump(){
-    volatile uint32_t *VectorTable = (volatile uint32_t *)0x20000000;
-    uint32_t vector_index = 0;
-    for(vector_index  = 0; vector_index  < 48; vector_index++)
-    {
-      VectorTable[vector_index ] = *(__IO uint32_t*)(APPLICATION_ADDRESS + (vector_index <<2));         // no VTOR on cortex-MO so need to copy vector table
-    }
-  //	  /* Enable the SYSCFG peripheral clock*/
-    do {
-       volatile uint32_t tmpreg;
-       ((((RCC_TypeDef *) ((((uint32_t)0x40000000U) + 0x00020000) + 0x00001000))->APB2ENR) |= ((0x1U << (0U))));
-           /* Delay after an RCC peripheral clock enabling */
-      tmpreg = ((((RCC_TypeDef *) ((((uint32_t)0x40000000U) + 0x00020000) + 0x00001000))->APB2ENR) & ((0x1U << (0U))));
-         ((void)(tmpreg));
-          } while(0U);
-  //	  /* Remap SRAM at 0x00000000 */
-    do {((SYSCFG_TypeDef *) (((uint32_t)0x40000000U) + 0x00010000))->CFGR1 &= ~((0x3U << (0U)));
-        ((SYSCFG_TypeDef *) (((uint32_t)0x40000000U) + 0x00010000))->CFGR1 |= ((0x1U << (0U)) | (0x2U << (0U)));
-      }while(0);
-
-    if (SysTick_Config(SystemCoreClock / 1000))
-     {
-       /* Capture error */
-       while (1)
-       {
-       }
-     }
-    __enable_irq();
-}
 
 
 void getSmoothedInput() {
@@ -592,33 +828,47 @@ void getSmoothedInput() {
 }
 
 void getBemfState(){
-
+	uint8_t current_state = 0;
+#ifdef MCU_F031
+	if (step == 1 || step == 4){
+	   current_state = PHASE_C_EXTI_PORT->IDR & PHASE_C_EXTI_PIN;
+	}
+    if (step == 2 || step == 5){            //        in phase two or 5 read from phase A Pf1
+    	current_state = PHASE_A_EXTI_PORT->IDR & PHASE_A_EXTI_PIN;
+	}
+    if (step == 3 || step == 6){                         // phase B pf0
+    	current_state = PHASE_B_EXTI_PORT->IDR & PHASE_B_EXTI_PIN;
+	}
+#else
+    current_state = !LL_COMP_ReadOutputLevel(active_COMP);  // polarity reversed
+#endif
     if (rising){
-    	if (LL_COMP_ReadOutputLevel(COMP1) == LL_COMP_OUTPUT_LEVEL_LOW){
+    	if (current_state){
     		bemfcounter++;
     		}else{
     		bad_count++;
-    		if(bad_count > 2){
+    		if(bad_count > bad_count_threshold){
     		bemfcounter = 0;
     		}
    	}
     }else{
-    	if(LL_COMP_ReadOutputLevel(COMP1) == LL_COMP_OUTPUT_LEVEL_HIGH){
+    	if(!current_state){
     		bemfcounter++;
     	}else{
     		bad_count++;
-    	    if(bad_count > 2){
+    	    if(bad_count > bad_count_threshold){
     	    bemfcounter = 0;
     	  }
     	}
     }
 }
 
-void commutate(){
-	commutation_intervals[step-1] = commutation_interval;
-	e_com_time = (commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] +commutation_intervals[5]) >> 1;  // COMMUTATION INTERVAL IS 0.5US INCREMENTS
 
-//	TIM14->CNT = 0;
+void commutate(){
+	commutation_intervals[step-1] = thiszctime;
+	e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] +commutation_intervals[5]) +4) >> 1;  // COMMUTATION INTERVAL IS 0.5US INCREMENTS
+
+//	COM_TIMER->CNT = 0;
 	if (forward == 1){
 		step++;
 		if (step > 6) {
@@ -634,6 +884,7 @@ void commutate(){
 		}
 		rising = !(step % 2);
 	}
+
 	if(!prop_brake_active){
 	comStep(step);
 	}
@@ -645,39 +896,45 @@ if(average_interval > 2000 && (stall_protection || RC_CAR_REVERSE)){
 }
 	bemfcounter = 0;
 	zcfound = 0;
-	timeout_count = 0;
+	  if(use_speed_control_loop && running){
+	  input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time)/10000;
+	  if(input_override > 2047){
+		  input_override = 2047;
+	  }
+	  if(input_override < 0){
+		  input_override = 0;
+	  }
+	  if(zero_crosses < 100){
+		  speedPid.integral = 0;
+	  }
+}
 }
 
 void PeriodElapsedCallback(){
 
-			TIM14->DIER &= ~((0x1UL << (0U)));             // disable interrupt
+			COM_TIMER->DIER &= ~((0x1UL << (0U)));             // disable interrupt
 			commutation_interval = (( 3*commutation_interval) + thiszctime)>>2;
 			commutate();
 			advance = (commutation_interval>>3) * advance_level;   // 60 divde 8 7.5 degree increments
 			waitTime = (commutation_interval >>1)  - advance;
 			if(!old_routine){
-			EXTI->IMR |= (1 << 21);     // enable comp interrupt
+			enableCompInterrupts();     // enable comp interrupt
 			}
 			if(zero_crosses<10000){
 			zero_crosses++;
 			}
-		//	TIM17->CNT = 0;
 
 }
 
 
 void interruptRoutine(){
 	if (average_interval > 125){
-if ((TIM2->CNT < 125) && (duty_cycle < 600) && (zero_crosses < 500)){    //should be impossible, desync?exit anyway
+if ((INTERVAL_TIMER->CNT < 125) && (duty_cycle < 600) && (zero_crosses < 500)){    //should be impossible, desync?exit anyway
 	return;
 }
-
-if (TIM2->CNT < commutation_interval >> 1){
+if (INTERVAL_TIMER->CNT < (commutation_interval >> 1)){
 	return;
 }
-
-
-
 stuckcounter++;             // stuck at 100 interrupts before the main loop happens again.
 if (stuckcounter > 100){
 	maskPhaseInterrupts();
@@ -685,83 +942,175 @@ if (stuckcounter > 100){
 	return;
 }
 	}
-
-	uint8_t bad_comp = 0;
-thiszctime = TIM2->CNT;
+thiszctime = INTERVAL_TIMER->CNT;
 			if (rising){
 			for (int i = 0; i < filter_level; i++){
-				if(LL_COMP_ReadOutputLevel(COMP1) == LL_COMP_OUTPUT_LEVEL_HIGH){
-					bad_comp++;
-						if(bad_comp > 1){ //as long there aren't two bad ones
-							return;
-						}
+#ifdef MCU_F031
+				if(!(current_GPIO_PORT->IDR & current_GPIO_PIN)){
+#else
+				if(LL_COMP_ReadOutputLevel(active_COMP) == LL_COMP_OUTPUT_LEVEL_HIGH){
+#endif
+					return;
 					}
-
 				}
 			}else{
 				for (int i = 0; i < filter_level; i++){
-				if(LL_COMP_ReadOutputLevel(COMP1) == LL_COMP_OUTPUT_LEVEL_LOW){
-					bad_comp++;
-						if(bad_comp > 1){
-							return;
-						}
+#ifdef MCU_F031
+				if((current_GPIO_PORT->IDR & current_GPIO_PIN)){
+#else
+				if(LL_COMP_ReadOutputLevel(active_COMP) == LL_COMP_OUTPUT_LEVEL_LOW){
+#endif
+					return;
 			    }
 				}
 			}
 							maskPhaseInterrupts();
-							LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_21);
-							TIM2->CNT = 0 ;
-
-
+                            thiszctime += INTERVAL_TIMER->CNT - thiszctime;
+							INTERVAL_TIMER->CNT = 0 ;
 		   waitTime = waitTime >> fast_accel;
-
-
-            TIM14->CNT = 0;
-            TIM14->ARR = waitTime;
-			TIM14->SR = 0x00;
-			TIM14->DIER |= (0x1UL << (0U));             // enable TIM14 interrupt
+            COM_TIMER->CNT = 0;
+            COM_TIMER->ARR = waitTime;
+			COM_TIMER->SR = 0x00;
+			COM_TIMER->DIER |= (0x1UL << (0U));             // enable COM_TIMER interrupt
 }
 
 void startMotor() {
 	if (running == 0){
 	commutate();
 	commutation_interval = 10000;
-	TIM2->CNT = 5000;
+	INTERVAL_TIMER->CNT = 5000;
 	running = 1;
 	}
-	EXTI->IMR |= (1 << 21);
-	sensorless = 1;
+	enableCompInterrupts();
 }
 
-
-
-
 void tenKhzRoutine(){
-	if(THIRTY_TWO_MS_TLM){
-		thirty_two_ms_count++;
-		if(thirty_two_ms_count>320){
-			send_telemetry = 1;
+
+
+	tenkhzcounter++;
+	if(tenkhzcounter > 10000){      // 1s sample interval 10000
+		consumed_current = (float)actual_current/360 + consumed_current;
+					switch (dshot_extended_telemetry){
+
+					case 1:
+					    send_extended_dshot = 0b0010 << 8 | degrees_celsius;
+					    dshot_extended_telemetry = 2;
+					break;
+					case 2:
+					    send_extended_dshot = 0b0110 << 8 | (uint8_t)actual_current/50;
+					    dshot_extended_telemetry = 3;
+					break;
+					case 3:
+					    send_extended_dshot = 0b0100 << 8 | (uint8_t)(battery_voltage/25);
+					    dshot_extended_telemetry = 1;
+					break;
+
+					}
+
+		tenkhzcounter = 0;
+	}
+if(!armed && (cell_count == 0)){
+	if(inputSet){
+		if(adjusted_input == 0){
+			armed_timeout_count++;
+			if(armed_timeout_count > 10000){    // one second
+				if(zero_input_count > 30){
+				armed = 1;
+				#ifdef USE_LED_STRIP
+			//	send_LED_RGB(0,0,0);
+				delayMicros(1000);
+				send_LED_RGB(0,255,0);
+				#endif
+				#ifdef USE_RGB_LED
+				  			GPIOB->BRR = LL_GPIO_PIN_3;    // turn on green
+				  			GPIOB->BSRR = LL_GPIO_PIN_8;   // turn on green
+				  			GPIOB->BSRR = LL_GPIO_PIN_5;
+				#endif
+				  			if((cell_count == 0) && LOW_VOLTAGE_CUTOFF){
+				  			  cell_count = battery_voltage / 370;
+				  			  for (int i = 0 ; i < cell_count; i++){
+				  			  playInputTune();
+				  			  delayMillis(100);
+				  			 LL_IWDG_ReloadCounter(IWDG);
+				  			  }
+				  			  }else{
+				  			  playInputTune();
+				  			  }
+				  			if(!servoPwm){
+				  				RC_CAR_REVERSE = 0;
+				  			}
+			}else{
+				inputSet = 0;
+				armed_timeout_count =0;
+			}
+			}
+		}else{
+			armed_timeout_count =0;
 		}
 	}
+}
 
-	if(!stepper_sine && !BRUSHED_MODE){
+	if(TLM_ON_INTERVAL){
+		telem_ms_count++;
+		if(telem_ms_count>telemetry_interval_ms*10){
+			send_telemetry = 1;
+			telem_ms_count = 0;
+		}
+	}
+#ifndef BRUSHED_MODE
+	if(!stepper_sine){
 	  if (input >= 47 +(80*use_sin_start) && armed){
 		  if (running == 0){
+			  allOff();
 			  if(!old_routine){
 			 startMotor();
 			  }
 			  running = 1;
 			  last_duty_cycle = min_startup_duty;
-#ifdef tmotor55
-			  GPIOB->BRR = LL_GPIO_PIN_3;  // off red
-			  GPIOA->BRR = LL_GPIO_PIN_15; // off green
-			  GPIOB->BSRR = LL_GPIO_PIN_5;  // on blue
-#endif
 
 		  }
-	//	  coasting = 0;
-	 //	 running = 1;
-	 	 duty_cycle = map(input, 47, 2047, minimum_duty_cycle, 2000) - (40*use_sin_start);
+	  if(use_sin_start){
+		duty_cycle = map(input, 137, 2047, minimum_duty_cycle, TIMER1_MAX_ARR);
+  	  }else{
+	 	 duty_cycle = map(input, 47, 2047, minimum_duty_cycle, TIMER1_MAX_ARR);
+	  }
+	  if(tenkhzcounter%10 == 0){     // 1khz PID loop
+		  if(use_current_limit && running){
+			use_current_limit_adjust -= (int16_t)(doPidCalculations(&currentPid, actual_current, CURRENT_LIMIT*100)/10000);
+			if(use_current_limit_adjust < minimum_duty_cycle){
+				use_current_limit_adjust = minimum_duty_cycle;
+			}
+			if(use_current_limit_adjust > duty_cycle){
+				use_current_limit_adjust = duty_cycle;
+			}
+
+	  }
+
+		  	 if(stall_protection && running ){  // this boosts throttle as the rpm gets lower, for crawlers and rc cars only, do not use for multirotors.
+		  		 stall_protection_adjust += (doPidCalculations(&stallPid, commutation_interval, stall_protect_target_interval))/10000;
+		  					 if(stall_protection_adjust > 150){
+		  						stall_protection_adjust = 150;
+		  					 }
+		  					 if(stall_protection_adjust <= 0){
+		  						stall_protection_adjust = 0;
+		  					 }
+		  	 }
+//			  if(use_speed_control_loop && running){
+//			  input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time)/10000;
+//			  if(input_override > 2047){
+//				  input_override = 2047;
+//			  }
+//			  if(input_override < 0){
+//				  input_override = 0;
+//			  }
+//			  if(zero_crosses < 100){
+//				  speedPid.integral = 0;
+//			  }
+//		}
+	  }
+	  if(!RC_CAR_REVERSE){
+		  prop_brake_active = 0;
+	  }
 	  }
 	  if (input < 47 + (80*use_sin_start)){
 		if(play_tone_flag != 0){
@@ -779,34 +1128,62 @@ void tenKhzRoutine(){
 			if(!running){
 				old_routine = 1;
 				zero_crosses = 0;
+				  if(brake_on_stop){
+					  fullBrake();
+				  }else{
+					  if(!prop_brake_active){
+					  allOff();
+					  }
+				  }
 			}
 			if (RC_CAR_REVERSE && prop_brake_active) {
+#ifndef PWM_ENABLE_BRIDGE
 					duty_cycle = getAbsDif(1000, newinput) + 1000;
-					proportionalBrake();
-			}
-
-
+					if(duty_cycle == 2000){
+						fullBrake();
+					}else{
+						proportionalBrake();
+					}
+#endif
+					}
 		  }else{
 		  if (!running){
 			  duty_cycle = 0;
-		  old_routine = 1;
-		  zero_crosses = 0;
-		  if(brake_on_stop){
-			  fullBrake();
-
-		  }else{
-         allOff();
-         duty_cycle = 0;
+			  old_routine = 1;
+			  zero_crosses = 0;
+			  bad_count = 0;
+			  	  if(brake_on_stop){
+			  		  if(!use_sin_start){
+#ifndef PWM_ENABLE_BRIDGE				
+			  			  duty_cycle = (TIMER1_MAX_ARR-19) + drag_brake_strength*2;
+			  			  proportionalBrake();
+			  			  prop_brake_active = 1;
+#else
+	//todo add proportional braking for pwm/enable style bridge.
+#endif
+			  		  }
+			  	  }else{
+			  		  allOff();
+			  		  duty_cycle = 0;
+			  	  }
 		  }
-		  }
 
-		 	  phase_A_position = 0;
-		 	  phase_B_position = 119;
-		 	  phase_C_position = 239;
+		  	  phase_A_position = ((step-1) * 60) + enter_sine_angle;
+		  	  if(phase_A_position > 359){
+		  		  phase_A_position -= 360;
+		  	  }
+		  	  phase_B_position = phase_A_position +  119;
+		  	  if(phase_B_position > 359){
+		  		  phase_B_position -= 360;
+		  	  }
+		  	  phase_C_position = phase_A_position + 239;
+		  	 if(phase_C_position > 359){
+		  	 phase_C_position -= 360;
+		  	 }
+
 		 	  if(use_sin_start == 1){
 		    	 stepper_sine = 1;
 		 	  }
-
 		  }
 		  }
 if(!prop_brake_active){
@@ -815,45 +1192,40 @@ if(!prop_brake_active){
 	   duty_cycle = min_startup_duty;
 
 	   }
-	   if (duty_cycle > 200<<stall_protection){
-		   duty_cycle = 200<<stall_protection;
+	   if (duty_cycle > startup_max_duty_cycle){
+		   duty_cycle = startup_max_duty_cycle;
 	   }
  }
 
-if (running){
-	 if(stall_protection){  // this boosts throttle as the rpm gets lower, for crawlers and rc cars only, do not use for multirotors.
-				 velocity_count++;
-				 if (velocity_count > velocity_count_threshold){
-					 if(commutation_interval > 9000){
-						    	// duty_cycle = duty_cycle + map(commutation_interval, 10000, 12000, 1, 100);
-						    	 minimum_duty_cycle++;
-						     }else{
-						    	 minimum_duty_cycle--;
-						     }
-					 if(minimum_duty_cycle > 200){
-						 minimum_duty_cycle = 200;
-					 }
-					 if(minimum_duty_cycle < (DEAD_TIME/2) + (eepromBuffer[25]/3)){
-						 minimum_duty_cycle= (DEAD_TIME/2) + (eepromBuffer[25]/3);
-					 }
-
-				velocity_count = 0;
-
-				 }
-	 }
-	 
- }
 	 if (duty_cycle > duty_cycle_maximum){
 		 duty_cycle = duty_cycle_maximum;
 	 }
+	 if(use_current_limit){
+		 if (duty_cycle > use_current_limit_adjust){
+			 duty_cycle = use_current_limit_adjust;
+		 }
+	 }
 
-		if(maximum_throttle_change_ramp){
+	 if(stall_protection_adjust > 0){
+
+		 duty_cycle = duty_cycle + (uint16_t)stall_protection_adjust;
+	 }
+	 if(maximum_throttle_change_ramp){
 	//	max_duty_cycle_change = map(k_erpm, low_rpm_level, high_rpm_level, 1, 40);
-			if(average_interval > 500){
-				max_duty_cycle_change = 10;
+#ifdef VOLTAGE_BASED_RAMP
+			uint16_t voltage_based_max_change = map(battery_voltage, 800, 2200, 10, 1);
+			if(average_interval > 200){
+				max_duty_cycle_change = voltage_based_max_change;
 			}else{
-				max_duty_cycle_change = 30;
+				max_duty_cycle_change = voltage_based_max_change * 3;
 			}
+#else
+			if(average_interval > 300){
+				max_duty_cycle_change = RAMP_SPEED_LOW_RPM;
+			}else{
+				max_duty_cycle_change = RAMP_SPEED_LOW_RPM * 3;
+			}
+#endif				
 
 	 if ((duty_cycle - last_duty_cycle) > max_duty_cycle_change){
 		duty_cycle = last_duty_cycle + max_duty_cycle_change;
@@ -870,27 +1242,20 @@ if (running){
 		fast_accel = 0;
 	}
 		}
-}
-		if (armed && running && (input > 47)){
-		if(VARIABLE_PWM){
-	    tim1_arr = map(commutation_interval, 96, 200, 999, TIMER1_MAX_ARR);
-		advance_level = eepromBuffer[23];
-		}
-	    adjusted_duty_cycle = ((duty_cycle * tim1_arr)/1999)+1;
+	}
+		if ((armed && running) && input > 47){
+			if(VARIABLE_PWM){
+				tim1_arr = map(commutation_interval, 96, 200, TIMER1_MAX_ARR/2, TIMER1_MAX_ARR);
+			}
+			adjusted_duty_cycle = ((duty_cycle * tim1_arr)/TIMER1_MAX_ARR)+1;
 		}else{
-			if(RC_CAR_REVERSE){
 				if(prop_brake_active){
 					adjusted_duty_cycle = TIMER1_MAX_ARR - ((duty_cycle * tim1_arr)/TIMER1_MAX_ARR)+1;
 				}else{
-				adjusted_duty_cycle = 0;
+				adjusted_duty_cycle = DEAD_TIME * running;
 				}
-			}else{
-				adjusted_duty_cycle = 0;
-			}
 	    }
 		last_duty_cycle = duty_cycle;
-
-
 	TIM1->ARR = tim1_arr;
 
 	TIM1->CCR1 = adjusted_duty_cycle;
@@ -898,48 +1263,66 @@ if (running){
 	TIM1->CCR3 = adjusted_duty_cycle;
 	}
 average_interval = e_com_time / 3;
-if(desync_check){
+if(desync_check && zero_crosses > 10){
 //	if(average_interval < last_average_interval){
 //
 //	}
-		if((getAbsDif(last_average_interval,average_interval) > average_interval>>1) && (average_interval < 1000)){ //throttle resitricted before zc 20.
-		zero_crosses = 10;
+		if((getAbsDif(last_average_interval,average_interval) > average_interval>>1) && (average_interval < 2000)){ //throttle resitricted before zc 20.
+		zero_crosses = 0;
 		desync_happened ++;
-//running = 0;
-//old_routine = 1;
+running = 0;
+old_routine = 1;
+if(zero_crosses > 100){
+average_interval = 5000;
+}
 		last_duty_cycle = min_startup_duty/2;
 		}
-
 		desync_check = 0;
 //	}
 	last_average_interval = average_interval;
 	}
-	if(send_telemetry){
+#ifndef MCU_F031
+if(commutation_interval > 400){
+	   NVIC_SetPriority(IC_DMA_IRQ_NAME, 0);
+	   NVIC_SetPriority(ADC1_COMP_IRQn, 1);
+}else{
+	NVIC_SetPriority(IC_DMA_IRQ_NAME, 1);
+	NVIC_SetPriority(ADC1_COMP_IRQn, 0);
+}
+#endif   //mcu f031
+
+#endif // ndef brushed_mode
+
+if(send_telemetry){
+#ifdef	USE_SERIAL_TELEMETRY
 	  makeTelemPackage(degrees_celsius,
 			           battery_voltage,
-	  					  1250,
-	  					  200,
-	  					  k_erpm);
+					   actual_current,
+	  				   (uint16_t)consumed_current,
+	  					e_rpm);
 	  send_telem_DMA();
+	  send_telemetry = 0;
+#endif
 	}
+#if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)
 
-	if(commutation_interval > 400){
-		   NVIC_SetPriority(IC_DMA_IRQ_NAME, 0);
-		   NVIC_SetPriority(ADC1_COMP_IRQn, 1);
-	}else{
-		NVIC_SetPriority(IC_DMA_IRQ_NAME, 1);
-		NVIC_SetPriority(ADC1_COMP_IRQn, 0);
-	}
-
+		if(INPUT_PIN_PORT->IDR & INPUT_PIN){
+			signaltimeout ++;
+			if(signaltimeout > 10000){
+				NVIC_SystemReset();
+			}
+		}else{
+			signaltimeout = 0;
+		}
+#else
 		signaltimeout++;
-		if(signaltimeout > 2500) { // quarter second timeout when armed;
+		if(signaltimeout > 5000) { // half second timeout when armed;
 			if(armed){
 				allOff();
 				armed = 0;
 				input = 0;
 				inputSet = 0;
 				zero_input_count = 0;
-			//	smallestnumber = 20000;
 				TIM1->CCR1 = 0;
 			    TIM1->CCR2 = 0;
 				TIM1->CCR3 = 0;
@@ -951,13 +1334,12 @@ if(desync_check){
 				NVIC_SystemReset();
 			}
 
-		if (signaltimeout > 25000){     // 1.5 second
+		if (signaltimeout > 25000){     // 2.5 second
 			allOff();
 			armed = 0;
 			input = 0;
 			inputSet = 0;
 			zero_input_count = 0;
-		//	smallestnumber = 20000;
 			TIM1->CCR1 = 0;
 		    TIM1->CCR2 = 0;
 			TIM1->CCR3 = 0;
@@ -969,6 +1351,7 @@ if(desync_check){
 			NVIC_SystemReset();
 		}
 			}
+#endif
 }
 
 
@@ -978,7 +1361,6 @@ if (!forward){
     if (phase_A_position > 359){
 	   phase_A_position = 0 ;
     }
-
 	    phase_B_position ++;
 	     if (phase_B_position > 359){
 		phase_B_position = 0 ;
@@ -988,11 +1370,10 @@ if (!forward){
 		phase_C_position = 0 ;
 	}
 }else{
-	phase_A_position --;
+	       phase_A_position --;
 	    if (phase_A_position < 0){
 		   phase_A_position = 359 ;
 	    }
-
 		    phase_B_position --;
 		     if (phase_B_position < 0){
 			phase_B_position = 359;
@@ -1002,27 +1383,28 @@ if (!forward){
 			phase_C_position = 359 ;
 		}
 }
-    if(GIMBAL_MODE){
-    TIM1->CCR1 = (2*pwmSin[phase_A_position])+gate_drive_offset;
-    TIM1->CCR2 = (2*pwmSin[phase_B_position])+gate_drive_offset;
-    TIM1->CCR3 = (2*pwmSin[phase_C_position])+gate_drive_offset;
-    }else{
-    TIM1->CCR1 = (2*pwmSin[phase_A_position]/3)+gate_drive_offset;
-    TIM1->CCR2 = (2*pwmSin[phase_B_position]/3)+gate_drive_offset;
-    TIM1->CCR3 = (2*pwmSin[phase_C_position]/3)+gate_drive_offset;
-    }
+#ifdef GIMBAL_MODE
+    TIM1->CCR1 = ((2*pwmSin[phase_A_position])+gate_drive_offset)*TIMER1_MAX_ARR/2000;
+    TIM1->CCR2 = ((2*pwmSin[phase_B_position])+gate_drive_offset)*TIMER1_MAX_ARR/2000;
+    TIM1->CCR3 = ((2*pwmSin[phase_C_position])+gate_drive_offset)*TIMER1_MAX_ARR/2000;
+#else
+    TIM1->CCR1 = (((2*pwmSin[phase_A_position]/SINE_DIVIDER)+gate_drive_offset)*TIMER1_MAX_ARR/2000)*sine_mode_power / 10;
+    TIM1->CCR2 = (((2*pwmSin[phase_B_position]/SINE_DIVIDER)+gate_drive_offset)*TIMER1_MAX_ARR/2000)*sine_mode_power / 10;
+    TIM1->CCR3 = (((2*pwmSin[phase_C_position]/SINE_DIVIDER)+gate_drive_offset)*TIMER1_MAX_ARR/2000)*sine_mode_power / 10;
+#endif
 }
 
 
 void zcfoundroutine(){   // only used in polling mode, blocking routine.
-	thiszctime = TIM2->CNT;
-	TIM2->CNT = 0;
+	thiszctime = INTERVAL_TIMER->CNT;
+	INTERVAL_TIMER->CNT = 0;
 	commutation_interval = (thiszctime + (3*commutation_interval)) / 4;
 	advance = commutation_interval / advancedivisor;
 	waitTime = commutation_interval /2  - advance;
-//	blanktime = commutation_interval / 4;
-	while (TIM2->CNT - thiszctime < waitTime - advance){
-
+	while (INTERVAL_TIMER->CNT < waitTime){
+    if(zero_crosses < 10){
+    	break;
+    }
 	}
 	commutate();
     bemfcounter = 0;
@@ -1030,42 +1412,79 @@ void zcfoundroutine(){   // only used in polling mode, blocking routine.
 
     zero_crosses++;
     if(stall_protection || RC_CAR_REVERSE){
-   	 if (zero_crosses >= 100 && commutation_interval <= 2000) {
+   	 if (zero_crosses >= 20 && commutation_interval <= 2000) {
    	    	old_routine = 0;
-   	    	EXTI->IMR |= (1 << 21);          // enable interrupt
+   	    	enableCompInterrupts();          // enable interrupt
 
     	 }
     }else{
     	if(zero_crosses > 30){
     	old_routine = 0;
-    	EXTI->IMR |= (1 << 21);          // enable interrupt
+    	enableCompInterrupts();          // enable interrupt
 
     }
     }
 
 }
+#ifdef BRUSHED_MODE
+void runBrushedLoop(){
 
+    uint16_t brushed_duty_cycle = 0;
+    
+	if(brushed_direction_set == 0 && adjusted_input > 48){
+		if(forward){
+			allOff();
+			delayMicros(10);
+			twoChannelForward();
+		}else{
+			allOff();
+			delayMicros(10);
+			twoChannelReverse();
+		}
+    	brushed_direction_set = 1;
+	}
+
+	brushed_duty_cycle = map(adjusted_input, 48, 2047, 0, TIMER1_MAX_ARR - 50);
+
+	   if(degrees_celsius > TEMPERATURE_LIMIT){
+		   duty_cycle_maximum = map(degrees_celsius, TEMPERATURE_LIMIT, TEMPERATURE_LIMIT+20, TIMER1_MAX_ARR/2, 1);
+	   }else{
+		   duty_cycle_maximum = TIMER1_MAX_ARR - 50;
+	   }
+	   if(brushed_duty_cycle > duty_cycle_maximum){
+		   brushed_duty_cycle = duty_cycle_maximum;
+	   }
+
+	  if(use_current_limit){
+		use_current_limit_adjust -= (int16_t)(doPidCalculations(&currentPid, actual_current, CURRENT_LIMIT*100)/10000);
+		if(use_current_limit_adjust < minimum_duty_cycle){
+			use_current_limit_adjust = minimum_duty_cycle;
+		}
+
+		 if (brushed_duty_cycle > use_current_limit_adjust){
+				 brushed_duty_cycle = use_current_limit_adjust;
+			 }
+	  }
+if((brushed_duty_cycle > 0) && armed){
+	  	TIM1->CCR1 = brushed_duty_cycle;
+		TIM1->CCR2 = brushed_duty_cycle;
+		TIM1->CCR3 = brushed_duty_cycle;
+		
+	}else{
+		TIM1->CCR1 = 0;												//
+		TIM1->CCR2 = 0;
+		TIM1->CCR3 = 0;
+		brushed_direction_set = 0;
+}
+}
+#endif
 
 int main(void)
 {
+
  initAfterJump();
 
-
- LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
- LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
-
-  SystemClock_Config();
-
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_COMP1_Init();
-  MX_TIM1_Init();
-  MX_TIM2_Init();
-
-  MX_TIM16_Init();
-  MX_TIM14_Init();
-  MX_TIM6_Init();
-  MX_TIM17_Init();
+ initCorePeripherals();
 
   LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH1);
   LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
@@ -1074,7 +1493,12 @@ int main(void)
   LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2N);
   LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH3N);
 
-  /* Enable counter */
+#ifdef MCU_G071
+  LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH5);  // timer used for comparator blanking
+#endif
+//  LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH4);      // timer used for timing adc read
+//  TIM1->CCR4 = 100;  // set in 10khz loop to match pwm cycle timed to end of pwm on
+   /* Enable counter */
   LL_TIM_EnableCounter(TIM1);
   LL_TIM_EnableAllOutputs(TIM1);
   /* Force update generation */
@@ -1083,50 +1507,61 @@ int main(void)
 #ifdef USE_ADC_INPUT
 
 #else
-  UN_TIM_Init();
   LL_TIM_CC_EnableChannel(IC_TIMER_REGISTER, IC_TIMER_CHANNEL);  // input capture and output compare
   LL_TIM_EnableCounter(IC_TIMER_REGISTER);
 #endif
 
-#ifdef tmotor55
-  LED_GPIO_init();
-  GPIOB->BSRR = LL_GPIO_PIN_3; // turn on red
+
+#ifdef USE_LED_STRIP
+send_LED_RGB(255,0,0);
 #endif
 
-   LL_TIM_EnableCounter(TIM14);               // commutation_timer priority 0
-   LL_TIM_GenerateEvent_UPDATE(TIM14);
-   LL_TIM_EnableIT_UPDATE(TIM14);
-   TIM14->DIER &= ~((0x1UL << (0U)));         // disable for now.
+#ifdef USE_RGB_LED
+  LED_GPIO_init();
+  GPIOB->BRR = LL_GPIO_PIN_8; // turn on red
+  GPIOB->BSRR = LL_GPIO_PIN_5;
+  GPIOB->BSRR = LL_GPIO_PIN_3; //
+#endif
 
-   LL_TIM_EnableCounter(TIM17);
-   LL_TIM_GenerateEvent_UPDATE(TIM17);
+#ifndef BRUSHED_MODE
+   LL_TIM_EnableCounter(COM_TIMER);               // commutation_timer priority 0
+   LL_TIM_GenerateEvent_UPDATE(COM_TIMER);
+   LL_TIM_EnableIT_UPDATE(COM_TIMER);
+   COM_TIMER->DIER &= ~((0x1UL << (0U)));         // disable for now.
+#endif
+   LL_TIM_EnableCounter(UTILITY_TIMER);
+   LL_TIM_GenerateEvent_UPDATE(UTILITY_TIMER);
+//
+   LL_TIM_EnableCounter(INTERVAL_TIMER);
+   LL_TIM_GenerateEvent_UPDATE(INTERVAL_TIMER);
 
-   LL_TIM_EnableCounter(TIM2);
-   LL_TIM_GenerateEvent_UPDATE(TIM2);
+   LL_TIM_EnableCounter(TEN_KHZ_TIMER);                 // 10khz timer
+   LL_TIM_GenerateEvent_UPDATE(TEN_KHZ_TIMER);
+   TEN_KHZ_TIMER->DIER |= (0x1UL << (0U));  // enable interrupt
+  //RCC->APB2ENR  &= ~(1 << 22);  // turn debug off
+#ifdef USE_ADC
+   ADC_Init();
+   enableADC_DMA();
+   activateADC();
+#endif
 
-   LL_TIM_EnableCounter(TIM6);                 // 10khz timer
-   LL_TIM_GenerateEvent_UPDATE(TIM6);
-
-   TIM6->DIER |= (0x1UL << (0U));  // enable interrupt
-
-   __IO uint32_t wait_loop_index = 0;
-  /* Enable comparator */
-   LL_COMP_Enable(COMP1);
-
+#ifndef MCU_F031
+  __IO uint32_t wait_loop_index = 0;
+    /* Enable comparator */
+  LL_COMP_Enable(MAIN_COMP);
+#ifdef N_VARIANT  // needs comp 1 and 2
+  LL_COMP_Enable(COMP1);
+#endif
    wait_loop_index = ((LL_COMP_DELAY_STARTUP_US * (SystemCoreClock / (100000 * 2))) / 10);
    while(wait_loop_index != 0)
    {
      wait_loop_index--;
    }
+#endif
 
-   ADC_Init();
-   enableADC_DMA();
-   activateADC();
-   telem_UART_Init();
-   MX_IWDG_Init();
-   LL_IWDG_ReloadCounter(IWDG);
- 
-  loadEEpromSettings();
+
+loadEEpromSettings();
+//  EEPROM_VERSION = *(uint8_t*)(0x08000FFC);
   if(firmware_info.version_major != eepromBuffer[3] || firmware_info.version_minor != eepromBuffer[4]){
 	  eepromBuffer[3] = firmware_info.version_major;
 	  eepromBuffer[4] = firmware_info.version_minor;
@@ -1135,7 +1570,6 @@ int main(void)
 	  }
 	  saveEEpromSettings();
   }
-
 
   if(use_sin_start){
   min_startup_duty = sin_mode_min_s_d;
@@ -1146,8 +1580,11 @@ int main(void)
 			forward = 1;
 		}
 	tim1_arr = TIMER1_MAX_ARR;
+	startup_max_duty_cycle = startup_max_duty_cycle * TIMER1_MAX_ARR / 2000  + dead_time_override;  // adjust for pwm frequency
+	throttle_max_at_low_rpm  = throttle_max_at_low_rpm * TIMER1_MAX_ARR / 2000;  // adjust to new pwm frequency
+    throttle_max_at_high_rpm = TIMER1_MAX_ARR;  // adjust to new pwm frequency
 	if(!comp_pwm){
-		use_sin_start = 0;
+		use_sin_start = 0;  // sine start requires complementary pwm.
 	}
 
 	if (RC_CAR_REVERSE) {         // overrides a whole lot of things!
@@ -1156,56 +1593,126 @@ int main(void)
 		use_sin_start = 0;
 		low_rpm_throttle_limit = 1;
 		VARIABLE_PWM = 0;
-		stall_protection = 1;
+		//stall_protection = 1;
 		comp_pwm = 0;
       	stuck_rotor_protection = 0;
-		minimum_duty_cycle = 100;
-		min_startup_duty = 180;
-
+		minimum_duty_cycle = minimum_duty_cycle + 50;
+		stall_protect_minimum_duty = stall_protect_minimum_duty + 50;
+		min_startup_duty = min_startup_duty + 50;
 	}
 
-	if(BRUSHED_MODE){bi_direction = 1;
-	 	 	 	 	  commutation_interval = 5000;}
+#ifdef MCU_F031
+	  GPIOF->BSRR = LL_GPIO_PIN_6;            // uncomment to take bridge out of standby mode and set oc level
+	  GPIOF->BRR = LL_GPIO_PIN_7;				// out of standby mode
+	  GPIOA->BRR = LL_GPIO_PIN_11;
+#endif
 
-	   if(BRUSHED_MODE){
-		   playBrushedStartupTune();
-	   }else{
-		   playStartupTune();
-	   }
-if (GIMBAL_MODE){
+
+#ifdef USE_CRSF_INPUT
+	inputSet = 1;
+	playStartupTune();
+	MX_IWDG_Init();
+	LL_IWDG_ReloadCounter(IWDG);
+#else
+#if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)
+ MX_IWDG_Init();
+ LL_IWDG_ReloadCounter(IWDG);
+ inputSet = 1;
+ armed = 1;
+ adjusted_input = 48;
+ newinput = 48;
+ advance_level = 3;
+#ifdef FIXED_SPEED_MODE
+ use_speed_control_loop = 1;
+ use_sin_start = 0;
+ target_e_com_time = 60000000 / FIXED_SPEED_MODE_RPM / (motor_poles/2) ;
+ input = 48;
+#endif
+
+#else
+#ifdef BRUSHED_MODE
+		//bi_direction = 1;
+	 	commutation_interval = 5000;
+	 	use_sin_start = 0;
+		maskPhaseInterrupts();
+		playBrushedStartupTune();
+#else
+	   playStartupTune();
+#endif
+	   zero_input_count = 0;
+	   MX_IWDG_Init();
+	   LL_IWDG_ReloadCounter(IWDG);
+#ifdef GIMBAL_MODE
 	bi_direction = 1;
 	use_sin_start = 1;
-}
+#endif
 
 #ifdef USE_ADC_INPUT
    armed_count_threshold = 5000;
    inputSet = 1;
 
 #else
+#ifdef RHINO80A_F051
+ LL_GPIO_SetPinPull(INPUT_PIN_PORT, INPUT_PIN, LL_GPIO_PULL_UP);
+#else 
  checkForHighSignal();     // will reboot if signal line is high for 10ms
+#endif
  receiveDshotDma();
+ if(drive_by_rpm){
+	 use_speed_control_loop = 1;
+}
 #endif
 
-  while (1)
-  {
-	  adc_counter++;
-	  if(adc_counter>100){   // for testing adc and telemetry
-		  degrees_celsius = __LL_ADC_CALC_TEMPERATURE(3300,  ADC_raw_temp, LL_ADC_RESOLUTION_12B);
-          battery_voltage = ((7 * battery_voltage) + (ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) /10) >> 3;
-          smoothed_raw_current = ((15*smoothed_raw_current + (ADC_raw_current) )>> 4);
+#endif      // end fixed duty mode ifdef
+#endif     // end crsf input
 
-		  LL_ADC_REG_StartConversion(ADC1);
+
+#ifdef MCU_F051
+ MCU_Id = DBGMCU->IDCODE &= 0xFFF;
+ REV_Id = DBGMCU->IDCODE >> 16;
+
+ if(REV_Id >= 4096){
+	 temperature_offset = 0;
+ }else{
+	 temperature_offset = 230;
+ }
+
+#endif
+ while (1)
+  {
+
+LL_IWDG_ReloadCounter(IWDG);
+
+	  adc_counter++;
+	  if(adc_counter>10){   // for adc and telemetry
+		  ADC_CCR = TIM1->CCR3*2/3 + 1;  // sample current at quarter pwm on
+		  if (ADC_CCR > tim1_arr){
+			  ADC_CCR = tim1_arr;
+		  }
+		  TIM1->CCR4 = ADC_CCR;
+
+		  ADC_raw_temp = ADC_raw_temp - (temperature_offset);
+		  converted_degrees =__LL_ADC_CALC_TEMPERATURE(3300,  ADC_raw_temp, LL_ADC_RESOLUTION_12B);
+		  degrees_celsius =((7 * degrees_celsius) + converted_degrees) >> 3;
+
+          battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER)/100)) >> 3;
+          smoothed_raw_current = ((63*smoothed_raw_current + (ADC_raw_current) )>>6);
+          actual_current = ((smoothed_raw_current * 3300/41) - (CURRENT_OFFSET*100))/ (MILLIVOLT_PER_AMP);
+		  if(actual_current < 0){actual_current = 0;}      
+
+          LL_ADC_REG_StartConversion(ADC1);
+
 		  if(LOW_VOLTAGE_CUTOFF){
 			  if(battery_voltage < (cell_count * low_cell_volt_cutoff)){
 				  low_voltage_count++;
-				  if(low_voltage_count > 1000){
+				  if(low_voltage_count > (20000 - (stepper_sine * 900))){
 				  input = 0;
 				  allOff();
 				  maskPhaseInterrupts();
 				  running = 0;
 				  zero_input_count = 0;
 				  armed = 0;
-			//	  playInputTune();
+
 				  }
 			  }else{
 				  low_voltage_count = 0;
@@ -1230,29 +1737,8 @@ if(newinput > 2000){
 }
 #endif
 	  stuckcounter = 0;
-	  LL_IWDG_ReloadCounter(IWDG);
-  		  if (zero_input_count > armed_count_threshold && !armed){
-  			  armed = 1;
-#ifdef tmotor55
-  			GPIOB->BRR = LL_GPIO_PIN_3;    // turn off red
-  			GPIOA->BSRR = LL_GPIO_PIN_15;   // turn on green
-#endif
-  			if(cell_count == 0 && LOW_VOLTAGE_CUTOFF){
-  			  cell_count = battery_voltage / 370;
-  			  for (int i = 0 ; i < cell_count; i++){
-  			  playInputTune();
-  			  delayMillis(100);
-  			 LL_IWDG_ReloadCounter(IWDG);
-  			  }
-  			  }else{
-  			  playInputTune();
-  			  }
-  			if(!servoPwm){
-  				RC_CAR_REVERSE = 0;
-  			}
 
-  		  }
-  		  if (bi_direction == 1 && proshot == 0 && dshot == 0){
+  		  if (bi_direction == 1 && dshot == 0){
   			  if(RC_CAR_REVERSE){
   				  if (newinput > (1000 + (servo_dead_band<<1))) {
   					  if (forward == dir_reversed) {
@@ -1290,7 +1776,7 @@ if(newinput > 2000){
   			  }else{
   				  if (newinput > (1000 + (servo_dead_band<<1))) {
   					  if (forward == dir_reversed) {
-  						  if(commutation_interval > 1500 || stepper_sine){
+  						  if((commutation_interval > reverse_speed_threshold )|| stepper_sine){
   							  forward = 1 - dir_reversed;
   							  zero_crosses = 0;
   							  old_routine = 1;
@@ -1304,7 +1790,7 @@ if(newinput > 2000){
   				  }
   				  if (newinput < (1000 -(servo_dead_band<<1))) {
   					  if (forward == (1 - dir_reversed)) {
-  						  if(commutation_interval > 1500 || stepper_sine){
+  						  if((commutation_interval > reverse_speed_threshold) || stepper_sine){
   							  zero_crosses = 0;
   							  old_routine = 1;
   							  forward = dir_reversed;
@@ -1323,11 +1809,11 @@ if(newinput > 2000){
   					brushed_direction_set = 0;
   				  }
   			  }
- 		  }else if ((proshot || dshot) && bi_direction) {
+ 		  }else if (dshot && bi_direction) {
   			  if (newinput > 1047) {
 
   				  if (forward == dir_reversed) {
-  					  if(commutation_interval > 1500 || stepper_sine){
+  					  if(commutation_interval > reverse_speed_threshold || stepper_sine){
   						  forward = 1 - dir_reversed;
   						  zero_crosses = 0;
   						  old_routine = 1;
@@ -1345,7 +1831,7 @@ if(newinput > 2000){
   				  //	startcount++;
 
   				  if (forward == (1 - dir_reversed)) {
-  					  if(commutation_interval > 1500 || stepper_sine){
+  					  if(commutation_interval > reverse_speed_threshold || stepper_sine){
   						  zero_crosses = 0;
   						  old_routine = 1;
   						  forward = dir_reversed;
@@ -1367,62 +1853,28 @@ if(newinput > 2000){
   		  }else{
   			  adjusted_input = newinput;
   		  }
-  		if(BRUSHED_MODE){
-  			if(brushed_direction_set == 0 && adjusted_input > 48){
-  				if(forward){
-  					allOff();
-  					delayMicros(10);
-  					comStep(6);
-  				}else{
-  					allOff();
-  					delayMicros(10);
-  					comStep(3);
-  				}
-  				brushed_direction_set = 1;
-  			}
-  			if(adjusted_input > 1900){
-  				adjusted_input = 1900;
-  			}
-  			input = map(adjusted_input, 48, 2047, 0, TIMER1_MAX_ARR);
-
-  			if(input > 0 && armed){
-  				TIM1->CCR1 = input;												// set duty cycle to 50 out of 768 to start.
-  				TIM1->CCR2 = input;
-  				TIM1->CCR3 = input;
-  			}else{
-  				TIM1->CCR1 = 0;												// set duty cycle to 50 out of 768 to start.
-  				TIM1->CCR2 = 0;
-  				TIM1->CCR3 = 0;
-  			//	fullBrake();
-  			}
-
-
-
-  		}else{
-
-
-
+#ifndef BRUSHED_MODE
 
 	 	 if ((zero_crosses > 1000) || (adjusted_input == 0)){
- 	 		bemf_timout_happened = 0;
-#ifdef tmotor55
+ 	 		bemf_timeout_happened = 0;
+#ifdef USE_RGB_LED
  	 		if(adjusted_input == 0 && armed){
-			  GPIOA->BSRR = LL_GPIO_PIN_15; // on green
-			  GPIOB->BRR = LL_GPIO_PIN_5;  // off blue
-			  GPIOB->BRR = LL_GPIO_PIN_3;  //off red
+			  GPIOB->BSRR = LL_GPIO_PIN_8; // off red
+			  GPIOB->BRR = LL_GPIO_PIN_5;  // on green
+			  GPIOB->BSRR = LL_GPIO_PIN_3;  //off blue
  	 		}
 #endif
  	 	 }
 	 	 if(zero_crosses > 100 && adjusted_input < 200){
-	 		bemf_timout_happened = 0;
+	 		bemf_timeout_happened = 0;
 	 	 }
 	 	 if(use_sin_start && adjusted_input < 160){
-	 		bemf_timout_happened = 0;
+	 		bemf_timeout_happened = 0;
 	 	 }
 
  	 	 if(crawler_mode){
  	 		if (adjusted_input < 400){
- 	 			bemf_timout_happened = 0;
+ 	 			bemf_timeout_happened = 0;
  	 		}
  	 	 }else{
  	 		if (adjusted_input < 150){              // startup duty cycle should be low enough to not burn motor
@@ -1431,63 +1883,102 @@ if(newinput > 2000){
  	 	 		bemf_timeout = 10;
  	 	 	 }
  	 	 }
-	  if(bemf_timout_happened > bemf_timeout * ( 1 + (crawler_mode*100))&& stuck_rotor_protection){
+	  if(bemf_timeout_happened > bemf_timeout * ( 1 + (crawler_mode*100))&& stuck_rotor_protection){
 	 		 allOff();
 	 		 maskPhaseInterrupts();
 	 		 input = 0;
-	 		bemf_timout_happened = 102;
-#ifdef tmotor55
-			  GPIOA->BRR = LL_GPIO_PIN_15; // off green
-			  GPIOB->BRR = LL_GPIO_PIN_5;  // off blue
+	 		bemf_timeout_happened = 102;
+#ifdef USE_RGB_LED
+			  GPIOB->BRR = LL_GPIO_PIN_8; // on red
+			  GPIOB->BSRR = LL_GPIO_PIN_5;  //
 			  GPIOB->BSRR = LL_GPIO_PIN_3;
 #endif
 	 	  }else{
-	 		 input=adjusted_input;
+#ifdef FIXED_DUTY_MODE
+  			input = FIXED_DUTY_MODE_POWER * 20 + 47;
+#else
+	  	  	if(use_sin_start){
+  				if(adjusted_input < 30){           // dead band ?
+  					input= 0;
+  					}
 
+  					if(adjusted_input > 30 && adjusted_input < (sine_mode_changeover_thottle_level * 20)){
+  					input= map(adjusted_input, 30 , (sine_mode_changeover_thottle_level * 20) , 47 ,160);
+  					}
+  					if(adjusted_input >= (sine_mode_changeover_thottle_level * 20)){
+  					input = map(adjusted_input , (sine_mode_changeover_thottle_level * 20) ,2047 , 160, 2047);
+  					}
+  				}else{
+  					if(use_speed_control_loop){
+  					  if (drive_by_rpm){
+ 						target_e_com_time = 60000000 / map(adjusted_input , 47 ,2047 , MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (motor_poles/2);
+  		  				if(adjusted_input < 47){           // dead band ?
+  		  					input= 0;
+  		  					speedPid.error = 0;
+  		  				    input_override = 0;
+  		  				}else{
+  	  						input = (uint16_t)input_override;  // speed control pid override
+  	  						if(input_override > 2047){
+  	  							input = 2047;
+  	  						}
+  	  						if(input_override < 48){
+  	  							input = 48;
+  	  						}
+  		  				}
+					    }else{
+
+  						input = (uint16_t)input_override;  // speed control pid override
+  						if(input_override > 2047){
+  							input = 2047;
+  						}
+  						if(input_override < 48){
+  							input = 48;
+  						}
+					    }
+  					}else{
+
+  						input = adjusted_input;
+
+  					}
+  				}
+#endif
 	 	  }
-
-
 		  if ( stepper_sine == 0){
 
+  e_rpm = running * (600000/ e_com_time);       // in tens of rpm
+  k_erpm =  e_rpm / 10; // ecom time is time for one electrical revolution in microseconds
 
-
-
-
-  k_erpm = running * ((1000000/ e_com_time) * 60) / 1000; // ecom time is time for one electrical revolution in microseconds
-   if(low_rpm_throttle_limit){     // some hardware doesn't need this, its on by default to keep hardware / motors protected but can slow down the response in the very low end a little.
+  if(low_rpm_throttle_limit){     // some hardware doesn't need this, its on by default to keep hardware / motors protected but can slow down the response in the very low end a little.
 
   duty_cycle_maximum = map(k_erpm, low_rpm_level, high_rpm_level, throttle_max_at_low_rpm, throttle_max_at_high_rpm);   // for more performance lower the high_rpm_level, set to a consvervative number in source.
    }
 
+   if(degrees_celsius > TEMPERATURE_LIMIT){
+	   duty_cycle_maximum = map(degrees_celsius, TEMPERATURE_LIMIT-10, TEMPERATURE_LIMIT+10, throttle_max_at_high_rpm/2, 1);
+   }
+
+
+
 
 if (zero_crosses < 100 || commutation_interval > 500) {
-
+#ifdef MCU_G071
+		TIM1->CCR5 = 100;  // comparator blanking
+#endif
 		filter_level = 12;
 
 	} else {
-
-		filter_level = map(average_interval, 100 , 500, 3 , 8);
-
-
+#ifdef MCU_G071
+		TIM1->CCR5 = 5;
+#endif
+		filter_level = map(average_interval, 100 , 500, 3, 10);
 	}
 	if (commutation_interval < 100){
 		filter_level = 2;
 	}
 
+if(motor_kv < 500){
 
-//	if (duty_cycle > 800 && zero_crosses > 100 && commutation_interval < 400){
-//		filter_level = 3;
-////		filter_delay = 0;
-//	}
-//
-//	if (commutation_interval < 90 && duty_cycle > 800){
-//		filter_level = 2;
-//	//	filter_delay = 0;
-//	}
-
-if(lowkv){
-
-	filter_level = low_kv_filter_level;
+	filter_level = filter_level * 2;
 }
 
 /**************** old routine*********************/
@@ -1508,20 +1999,27 @@ if (old_routine && running){
 	 		  }
 	 	  }
 }
-	 	  if (TIM2->CNT > 40000 && running == 1){
-              bemf_timout_happened ++;
-	 		  zcfoundroutine();
+	 	  if (INTERVAL_TIMER->CNT > 45000 && running == 1){
+              bemf_timeout_happened ++;
+
 	 		  maskPhaseInterrupts();
 	 		  old_routine = 1;
+	 		  if(input < 48){
 	 		   running = 0;
+	 		  }
 	 		   zero_crosses = 0;
-	 		   if(crawler_mode&&stall_protection){
-	 			   min_startup_duty = 120;
-	 		   }
+	 		   zcfoundroutine();
+	 		   // if(stall_protection){
+	 			   // min_startup_duty = 130;
+	 				 // minimum_duty_cycle = minimum_duty_cycle + 10;
+	 				 // if(minimum_duty_cycle > 80){
+	 					 // minimum_duty_cycle = 80;
+	 				 // }
+	 		   // }
 	 	  }
 	 	  }else{            // stepper sine
 
-	 			if(GIMBAL_MODE){
+#ifdef GIMBAL_MODE
 	 				step_delay = 300;
 	 				maskPhaseInterrupts();
 	 				allpwm();
@@ -1542,21 +2040,30 @@ if (old_routine && running){
 	 					delayMicros(step_delay);
 	 					current_angle++;
 	 				}
-	 			}else{
+#else
 
 
 
 if(input > 48 && armed){
 
 	 		  if (input > 48 && input < 137){// sine wave stepper
-	 //			 LL_TIM_DisableIT_UPDATE(TIM1);
-	 			 maskPhaseInterrupts();
-	 			 allpwm();
+
+	   	 	if(do_once_sinemode){
+				COM_TIMER->DIER &= ~((0x1UL << (0U)));  // disable commutation interrupt in case set
+	   	 		maskPhaseInterrupts();
+	   	 		TIM1->CCR1 = 0;
+	   	 		TIM1->CCR2 = 0;
+	   	 		TIM1->CCR3 = 0;
+	   	 		allpwm();
+	   	 		do_once_sinemode = 0;
+	   	 	}
 	 		 advanceincrement();
-             step_delay = map (input, 48, 137, 7000/motor_poles, 840/motor_poles);
+             step_delay = map (input, 48, 120, 7000/motor_poles, 810/motor_poles);
 	 		 delayMicros(step_delay);
+			 e_rpm =   600/ step_delay ;         // in hundreds so 33 e_rpm is 3300 actual erpm
 
 	 		  }else{
+				   do_once_sinemode = 1;
 	 			 advanceincrement();
 	 			  if(input > 200){
 	 				 phase_A_position = 0;
@@ -1568,33 +2075,58 @@ if(input > 48 && armed){
 	 			  stepper_sine = 0;
 	 			  running = 1;
 				  old_routine = 1;
-	 			 zero_crosses = 0;
+		 		  commutation_interval = 9000;
+		 		  average_interval = 9000;
+				  last_average_interval = average_interval;
+		 		  INTERVAL_TIMER->CNT = 9000;
+				  zero_crosses = 10;
+				  prop_brake_active = 0;
 	 			  step = changeover_step;                    // rising bemf on a same as position 0.
-	 //			 LL_TIM_EnableIT_UPDATE(TIM1);
-	 			LL_TIM_GenerateEvent_UPDATE(TIM1);
-	 			  zcfoundroutine();
+		 		// comStep(step);// rising bemf on a same as position 0.
+				if(stall_protection){
+				minimum_duty_cycle = stall_protect_minimum_duty;
+				}
+	 			commutate();
+	 			//enableCompInterrupts();
+				LL_TIM_GenerateEvent_UPDATE(TIM1);
+	 		//	  zcfoundroutine();
 	 			  }
 	 		  }
 
 }else{
-	TIM1->CCR1 = 0;												// set duty cycle to 50 out of 768 to start.
+	do_once_sinemode = 1;
+	if(brake_on_stop){
+#ifndef PWM_ENABLE_BRIDGE
+	duty_cycle = (TIMER1_MAX_ARR-19) + drag_brake_strength*2;
+	adjusted_duty_cycle = TIMER1_MAX_ARR - ((duty_cycle * tim1_arr)/TIMER1_MAX_ARR)+1;
+proportionalBrake();
+	TIM1->CCR1 = adjusted_duty_cycle;
+	TIM1->CCR2 = adjusted_duty_cycle;
+	TIM1->CCR3 = adjusted_duty_cycle;
+	
+	prop_brake_active = 1;
+#else
+		// todo add braking for PWM /enable style bridges.
+#endif
+	}else{
+	TIM1->CCR1 = 0;
 	TIM1->CCR2 = 0;
 	TIM1->CCR3 = 0;
-	fullBrake();
+	allOff();
+	}
 }
 
-	 			}
-	 	  }
-  }// end of brushed mode override
-  }
+#endif      // gimbal mode
+	 }  // stepper/sine mode end
+#endif    // end of brushless mode
+
+#ifdef BRUSHED_MODE
+runBrushedLoop();
+#endif
+  		}
 }
 
 
-
-void Error_Handler(void)
-{
-
-}
 
 #ifdef  USE_FULL_ASSERT
 /**
@@ -1605,12 +2137,10 @@ void Error_Handler(void)
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
-{ 
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
-

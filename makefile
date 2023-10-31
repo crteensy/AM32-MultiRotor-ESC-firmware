@@ -1,48 +1,51 @@
+QUIET = @
+
+# tools
 CC = $(ARM_SDK_PREFIX)gcc
 CP = $(ARM_SDK_PREFIX)objcopy
-MCU := -mcpu=cortex-m0 -mthumb
-LDSCRIPT := STM32F051K6TX_FLASH.ld
-LIBS := -lc -lm -lnosys 
-LDFLAGS := -specs=nano.specs -T$(LDSCRIPT) $(LIBS) -Wl,--gc-sections -Wl,--print-memory-usage
-MAIN_SRC_DIR := Src
-SRC_DIR := Startup \
-	Src \
-	Drivers/STM32F0xx_HAL_Driver/Src
-SRC := $(foreach dir,$(SRC_DIR),$(wildcard $(dir)/*.[cs]))
-INCLUDES :=  \
-	-IInc \
-	-IDrivers/STM32F0xx_HAL_Driver/Inc \
-	-IDrivers/CMSIS/Include \
-	-IDrivers/CMSIS/Device/ST/STM32F0xx/Include 
-VALUES :=  \
-	-DUSE_MAKE \
-	-DHSE_VALUE=8000000 \
-	-DSTM32F051x8 \
-	-DHSE_STARTUP_TIMEOUT=100 \
-	-DLSE_STARTUP_TIMEOUT=5000 \
-	-DLSE_VALUE=32768 \
-	-DDATA_CACHE_ENABLE=0 \
-	-DINSTRUCTION_CACHE_ENABLE=0 \
-	-DVDD_VALUE=3300 \
-	-DLSI_VALUE=40000 \
-	-DHSI_VALUE=8000000 \
-	-DUSE_FULL_LL_DRIVER \
-	-DPREFETCH_ENABLE=1
-CFLAGS = $(MCU) $(VALUES) $(INCLUDES) -O2 -Wall -fdata-sections -ffunction-sections
-CFLAGS += -D$(TARGET)
-CFLAGS += -MMD -MP -MF $(@:%.bin=%.d)
+ECHO = echo
 
-TARGETS := FD6288 MP6531 IFLIGHT TMOTOR55 TMOTOR45 HGLRC SISKIN DIATONE MAMBA_F40PRO MAMBA_F50PRO MAMBA_F60PRO
+# common variables
+IDENTIFIER := AM32
+
+# Folders
+HAL_FOLDER := Mcu
+MAIN_SRC_DIR := Src
+MAIN_INC_DIR := Inc
+
+SRC_DIRS_COMMON := $(MAIN_SRC_DIR)
+
+# Include processor specific makefiles
+include f051makefile.mk
+include g071makefile.mk
+include f031makefile.mk
+
+# Default MCU type to F051
+MCU_TYPE ?= F051
+
+# additional libs
+LIBS := -lc -lm -lnosys
+
+# Compiler options
+CFLAGS_COMMON := -DUSE_MAKE
+CFLAGS_COMMON += -I$(MAIN_INC_DIR) -O3 -Wall -ffunction-sections
+CFLAGS_COMMON += -D$(TARGET)
+
+# Linker options
+LDFLAGS_COMMON := -specs=nano.specs $(LIBS) -Wl,--gc-sections -Wl,--print-memory-usage
 
 # Working directories
 ROOT := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
 
-VERSION_MAJOR := $(shell grep " VERSION_MAJOR" Src/main.c | awk '{print $$3}' )
-VERSION_MINOR := $(shell grep " VERSION_MINOR" Src/main.c | awk '{print $$3}' )
+# Search source files
+SRC_COMMON := $(foreach dir,$(SRC_DIRS_COMMON),$(wildcard $(dir)/*.[cs]))
+
+VERSION_MAJOR := $(shell grep " VERSION_MAJOR" $(MAIN_SRC_DIR)/main.c | awk '{print $$3}' )
+VERSION_MINOR := $(shell grep " VERSION_MINOR" $(MAIN_SRC_DIR)/main.c | awk '{print $$3}' )
 
 FIRMWARE_VERSION := $(VERSION_MAJOR).$(VERSION_MINOR)
 
-TARGET_BASENAME = $(BIN_DIR)/$(TARGET)_$(FIRMWARE_VERSION)
+TARGET_BASENAME = $(BIN_DIR)/$(IDENTIFIER)_$(TARGET)_$(FIRMWARE_VERSION)
 
 # Build tools, so we all share the same versions
 # import macros common to all supported build systems
@@ -54,29 +57,48 @@ BIN_DIR := $(ROOT)/obj
 TOOLS_DIR ?= $(ROOT)/tools
 DL_DIR := $(ROOT)/downloads
 
-.PHONY : clean all
-all : $(TARGETS)
+.PHONY : clean all binary f051 g071 f031
+all : $(TARGETS_F051) $(TARGETS_G071) $(TARGETS_F031)
+f051 : $(TARGETS_F051)
+g071 : $(TARGETS_G071)
+f031 : $(TARGETS_F031)
 
 clean :
 	rm -rf $(BIN_DIR)/*
 
-$(TARGETS) :
-	$(MAKE) TARGET=$@ binary
-
 binary : $(TARGET_BASENAME).bin
+	@$(ECHO) All done
 
-$(TARGET_BASENAME).bin : $(SRC)
-	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET_BASENAME).elf $(SRC)
-	$(CP) -O binary $(TARGET_BASENAME).elf $(TARGET_BASENAME).bin
-	$(CP) $(TARGET_BASENAME).elf -O ihex  $(TARGET_BASENAME).hex
+$(TARGETS_F051) :
+	@$(MAKE) -s MCU_TYPE=F051 TARGET=$@ binary
+
+$(TARGETS_G071) :
+	@$(MAKE) -s MCU_TYPE=G071 TARGET=$@ binary
+
+$(TARGETS_F031) :
+	@$(MAKE) -s MCU_TYPE=F031 TARGET=$@ binary
+
+# Compile target
+$(TARGET_BASENAME).elf: SRC := $(SRC_COMMON) $(SRC_$(MCU_TYPE))
+$(TARGET_BASENAME).elf: CFLAGS := $(MCU_F051) $(CFLAGS_$(MCU_TYPE)) $(CFLAGS_COMMON)
+$(TARGET_BASENAME).elf: LDFLAGS := $(LDFLAGS_COMMON) $(LDFLAGS_$(MCU_TYPE)) -T$(LDSCRIPT_$(MCU_TYPE))
+$(TARGET_BASENAME).elf: $(SRC)
+	@$(ECHO) Compiling $(notdir $@)
+	$(QUIET)mkdir -p $(dir $@)
+	$(QUIET)$(CC) $(CFLAGS) $(LDFLAGS) -MMD -MP -MF $(@:.elf=.d) -o $(@) $(SRC)
+
+# Generate bin and hex files
+$(TARGET_BASENAME).bin: $(TARGET_BASENAME).elf
+	@$(ECHO) Generating $(notdir $@)
+	$(QUIET)$(CP) -O binary $(<) $@
+	$(QUIET)$(CP) $(<) -O ihex $(@:.bin=.hex)
 
 # mkdirs
 $(DL_DIR):
-	mkdir -p $@
+	$(QUIET)mkdir -p $@
 
 $(TOOLS_DIR):
-	mkdir -p $@
+	$(QUIET)mkdir -p $@
 
 # include the tools makefile
 include $(ROOT)/make/tools.mk
