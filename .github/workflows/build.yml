@@ -37,12 +37,12 @@ jobs:
       - name: Make artifact name
         id: make_artifactname
         run: |
-          ARTIFACT_NAME="AM32-F051-${{ github.run_number }}"
+          ARTIFACT_NAME="AM32-BUILD-${{ github.run_number }}"
           echo "${ARTIFACT_NAME}"
           echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_ENV
 
       - name: Build All Targets
-        run: make all
+        run: make AM32REF
 
       - name: Upload Bin Files
         uses: actions/upload-artifact@v2

@@ -10,6 +10,7 @@
 #include "dshot.h"
 #include "serial_telemetry.h"
 #include "functions.h"
+#include "common.h"
 
 //int max_servo_deviation = 250;
 //int servorawinput;
@@ -17,7 +18,7 @@ char ic_timer_prescaler = 1;
 char output_timer_prescaler;
 int buffersize = 32;
 int smallestnumber = 20000;
-uint32_t dma_buffer[64];
+uint32_t dma_buffer[64] = {0};
 char out_put = 0;
 char buffer_divider = 44;
 int dshot_runout_timer = 62500;
@@ -103,10 +104,6 @@ void sendDshotDma(){
 void detectInput(){
 	smallestnumber = 20000;
 	dshot = 0;
-//	proshot = 0;
-//	multishot = 0;
-//	oneshot42 = 0;
-//	oneshot125 = 0;
 	servoPwm = 0;
 	int lastnumber = dma_buffer[0];
 	for ( int j = 1 ; j < 31; j++){
@@ -138,16 +135,9 @@ void detectInput(){
 		buffersize = 32;
 	}
 	if ((smallestnumber > 100 )&&(smallestnumber < 400)){
-	//	multishot = 1;
 		armed_count_threshold = 1000;
 		buffersize = 4;
 	}
-//	if ((smallestnumber > 2000 )&&(smallestnumber < 3000)){
-//		oneshot42 = 1;
-//	}
-////	if ((smallestnumber > 3000 )&&(smallestnumber < 7000)){
-////		oneshot125 = 1;
-////	}
 	if (smallestnumber > 1500){
 		servoPwm = 1;
 		ic_timer_prescaler=63;
